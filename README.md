@@ -2,6 +2,8 @@
 
 Hover your cursor over the MacBook notch — a panel drops down with current Claude subscription usage limits for **all your Claude Code profiles at once**: 5-hour session window, weekly window, per-model weekly windows (the "Fable | All models" split), percent used and reset time for each account.
 
+![NotchUsage panel](docs/screenshot-en.png)
+
 Built because none of the existing notch trackers support multiple Claude accounts (personal + work via `CLAUDE_CONFIG_DIR`) simultaneously.
 
 По-русски: [README.ru.md](README.ru.md)

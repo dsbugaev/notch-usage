@@ -206,12 +206,13 @@ func fmtReset(_ d: Date) -> String {
     time.dateFormat = "HH:mm"
     if cal.isDateInToday(d) { return "→ \(time.string(from: d))" }
     if cal.isDateInTomorrow(d) {
-        let rel = DateFormatter()
+        // "tomorrow"/"завтра" as a single localized word + our compact time —
+        // full relative DateFormatter output ("Tomorrow at 1:49 AM") overflows
+        let rel = RelativeDateTimeFormatter()
         rel.locale = appLocale
-        rel.doesRelativeDateFormatting = true
-        rel.dateStyle = .medium
-        rel.timeStyle = .short
-        return "→ \(rel.string(from: d))"
+        rel.dateTimeStyle = .named
+        let word = rel.localizedString(from: DateComponents(day: 1))
+        return "→ \(word) \(time.string(from: d))"
     }
     let wd = DateFormatter()
     wd.locale = appLocale
@@ -374,7 +375,8 @@ func detectCLIVersion() {
     userAgentHolder.set("claude-code/\(ver[range])")
 }
 
-func fetchUsage(token: String, labels: [String: String], completion: @escaping ([UsageLine]?, String?) -> Void) {
+func fetchUsage(token: String, labels: [String: String],
+                completion: @escaping ([UsageLine]?, String?, Int?) -> Void) {
     var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
     req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
     req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
@@ -382,28 +384,28 @@ func fetchUsage(token: String, labels: [String: String], completion: @escaping (
     req.timeoutInterval = 15
     URLSession.shared.dataTask(with: req) { data, resp, err in
         if let err = err {
-            completion(nil, "network: \(err.localizedDescription)")
+            completion(nil, "network: \(err.localizedDescription)", nil)
             return
         }
         guard let http = resp as? HTTPURLResponse else {
-            completion(nil, "no response")
+            completion(nil, "no response", nil)
             return
         }
         switch http.statusCode {
         case 200:
             guard let data = data,
                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                completion(nil, "malformed JSON")
+                completion(nil, "malformed JSON", 200)
                 return
             }
             let lines = parseUsage(obj, labels: labels)
-            completion(lines.isEmpty ? nil : lines, lines.isEmpty ? "empty API response" : nil)
+            completion(lines.isEmpty ? nil : lines, lines.isEmpty ? "empty API response" : nil, 200)
         case 401:
-            completion(nil, "token expired — open Claude Code")
+            completion(nil, "token expired — open Claude Code", 401)
         case 429:
-            completion(nil, "rate-limited by usage API (429)")
+            completion(nil, "rate-limited by usage API (429)", 429)
         default:
-            completion(nil, "HTTP \(http.statusCode)")
+            completion(nil, "HTTP \(http.statusCode)", http.statusCode)
         }
     }.resume()
 }
@@ -423,6 +425,11 @@ final class Store: ObservableObject {
     // touched there, and first-run permission dialogs appear one at a time
     private let credsQueue = DispatchQueue(label: "ru.bugaev.notchusage.creds", qos: .userInitiated)
     private var deniedServices = Set<String>()
+    // Claude Code resets a record's "Always Allow" list every time it rotates
+    // the token, so every keychain read risks a permission dialog. Cache the
+    // token in memory and go back to the keychain only on startup or when the
+    // API says the token died (401) — dialogs then coincide with real rotations.
+    private var tokenCache: [String: String] = [:]
 
     init(cfg: AppConfig, demo: Bool) {
         self.cfg = cfg
@@ -459,7 +466,10 @@ final class Store: ObservableObject {
     }
 
     func forceRefresh() {
-        credsQueue.async { self.deniedServices.removeAll() }
+        credsQueue.async {
+            self.deniedServices.removeAll()
+            self.tokenCache.removeAll()
+        }
         lastFetch = nil
         refresh()
     }
@@ -477,31 +487,52 @@ final class Store: ObservableObject {
         credsQueue.async {
             let existing = claudeKeychainServices()
             for (idx, acct) in accounts.enumerated() {
-                let (creds, credErr) = self.loadCreds(acct: acct, existing: existing)
-                guard let creds else {
-                    DispatchQueue.main.async {
-                        if self.generation == gen { self.statuses[idx].error = credErr }
-                        group.leave()
-                    }
-                    continue
-                }
-                fetchUsage(token: creds.accessToken, labels: labelsSnapshot) { lines, err in
-                    DispatchQueue.main.async {
-                        if self.generation == gen {
-                            if let lines {
-                                self.statuses[idx].lines = lines
-                                self.statuses[idx].error = nil
-                                self.statuses[idx].updatedAt = Date()
-                            } else {
-                                self.statuses[idx].error = err ?? "unknown error"
-                            }
-                        }
-                        group.leave()
-                    }
+                self.fetchAccount(idx: idx, acct: acct, existing: existing, gen: gen,
+                                  labels: labelsSnapshot, allowRetry: true) {
+                    group.leave()
                 }
             }
         }
         group.notify(queue: .main) { self.refreshing = false }
+    }
+
+    // credsQueue only
+    private func fetchAccount(idx: Int, acct: AccountConfig, existing: Set<String>, gen: Int,
+                              labels: [String: String], allowRetry: Bool,
+                              done: @escaping () -> Void) {
+        let dir = expandPath(acct.configDir)
+        let (creds, credErr) = loadCreds(acct: acct, existing: existing)
+        guard let creds else {
+            DispatchQueue.main.async {
+                if self.generation == gen { self.statuses[idx].error = credErr }
+                done()
+            }
+            return
+        }
+        fetchUsage(token: creds.accessToken, labels: labels) { lines, err, http in
+            if http == 401, allowRetry {
+                // The cached token died (Claude rotated it) — drop it and
+                // re-read the keychain once
+                self.credsQueue.async {
+                    self.tokenCache[dir] = nil
+                    self.fetchAccount(idx: idx, acct: acct, existing: existing, gen: gen,
+                                      labels: labels, allowRetry: false, done: done)
+                }
+                return
+            }
+            DispatchQueue.main.async {
+                if self.generation == gen {
+                    if let lines {
+                        self.statuses[idx].lines = lines
+                        self.statuses[idx].error = nil
+                        self.statuses[idx].updatedAt = Date()
+                    } else {
+                        self.statuses[idx].error = err ?? "unknown error"
+                    }
+                }
+                done()
+            }
+        }
     }
 
     // Hot config reload: keep already-loaded data for profiles that stayed
@@ -538,10 +569,14 @@ final class Store: ObservableObject {
     // credsQueue only
     private func loadCreds(acct: AccountConfig, existing: Set<String>) -> (Creds?, String?) {
         let dir = expandPath(acct.configDir)
+        if let cached = tokenCache[dir] { return (Creds(accessToken: cached), nil) }
         // A .credentials.json file inside the profile dir wins over the keychain
         // (mirrors Claude Code's own lookup order)
         let fileURL = URL(fileURLWithPath: dir).appendingPathComponent(".credentials.json")
-        if let data = try? Data(contentsOf: fileURL), let c = parseCreds(data) { return (c, nil) }
+        if let data = try? Data(contentsOf: fileURL), let c = parseCreds(data) {
+            tokenCache[dir] = c.accessToken
+            return (c, nil)
+        }
 
         let candidates = effectiveCandidates(configDir: dir, existing: existing)
         if candidates.isEmpty {
@@ -555,7 +590,10 @@ final class Store: ObservableObject {
                 continue
             }
             let r = tryReadService(service)
-            if let c = r.creds { return (c, nil) }
+            if let c = r.creds {
+                tokenCache[dir] = c.accessToken
+                return (c, nil)
+            }
             if r.status == errSecUserCanceled {
                 deniedServices.insert(service)
                 denied = true
@@ -696,6 +734,7 @@ struct PanelView: View {
                 .font(.system(size: 10))
                 .foregroundColor(Color.white.opacity(0.45))
                 .lineLimit(1)
+                .minimumScaleFactor(0.7)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
     }

@@ -1,6 +1,7 @@
 build/
 *.log
 *.png
+!docs/screenshot-*.png
 .DS_Store
 # local working notes, not part of the public repo
 /CLAUDE.md

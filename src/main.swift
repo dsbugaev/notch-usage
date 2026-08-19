@@ -116,9 +116,21 @@ func keychainReadData(service: String) -> (Data?, OSStatus) {
 }
 
 // Single read+parse step shared by loadCreds and kcDebug so the two never drift
-func tryReadService(_ service: String) -> (creds: Creds?, status: OSStatus, bytes: Int) {
+func tryReadService(_ service: String) -> (creds: Creds?, status: OSStatus, data: Data?) {
     let (data, status) = keychainReadData(service: service)
-    return (data.flatMap(parseCreds), status, data?.count ?? 0)
+    return (data.flatMap(parseCreds), status, data)
+}
+
+// Which records to actually read for a profile. The bare record is canonical
+// for the default ~/.claude profile: when it exists, never touch the hashed
+// variant — stale hashed duplicates from old Claude Code versions otherwise
+// trigger keychain permission prompts for a dead record
+func effectiveCandidates(configDir: String, existing: Set<String>) -> [String] {
+    var candidates = candidateServices(configDir: configDir).filter { existing.contains($0) }
+    if candidates.count > 1 && candidates.first == kcPrefix {
+        candidates = [kcPrefix]
+    }
+    return candidates
 }
 
 // MARK: - Usage API
@@ -502,7 +514,7 @@ final class Store: ObservableObject {
         let fileURL = URL(fileURLWithPath: dir).appendingPathComponent(".credentials.json")
         if let data = try? Data(contentsOf: fileURL), let c = parseCreds(data) { return (c, nil) }
 
-        let candidates = candidateServices(configDir: dir).filter { existing.contains($0) }
+        let candidates = effectiveCandidates(configDir: dir, existing: existing)
         if candidates.isEmpty {
             return (nil, "no keychain record — run /login in this profile")
         }
@@ -537,14 +549,24 @@ final class Store: ObservableObject {
             for s in existing { print("  \(s)") }
             for acct in cfg.accounts {
                 let dir = expandPath(acct.configDir)
+                let effective = effectiveCandidates(configDir: dir, existing: Set(existing))
                 print("account [\(acct.name)] dir [\(dir)]:")
                 for c in candidateServices(configDir: dir) {
                     guard existing.contains(c) else {
                         print("  candidate \(c): MISSING")
                         continue
                     }
+                    guard effective.contains(c) else {
+                        print("  candidate \(c): skipped (stale duplicate, not read)")
+                        continue
+                    }
                     let r = tryReadService(c)
-                    print("  candidate \(c): present, read status \(r.status), bytes \(r.bytes), parses \(r.creds != nil)")
+                    let bytes = r.data?.count ?? 0
+                    print("  candidate \(c): present, read status \(r.status), bytes \(bytes), parses \(r.creds != nil)")
+                    if r.creds == nil, let data = r.data, bytes > 0,
+                       let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                        print("    top-level keys: \(obj.keys.sorted().joined(separator: ", "))")
+                    }
                 }
             }
         }
@@ -1034,6 +1056,11 @@ func runSelfTest() -> Int {
     let custom = candidateServices(configDir: "~/some-profile")
     let expectedSuffix = sha256Hex(expandPath("~/some-profile")).prefix(8)
     check(custom == ["\(kcPrefix)-\(expectedSuffix)"], "custom profile: hashed service only")
+    let defaultHashed = "\(kcPrefix)-\(sha256Hex(expandPath("~/.claude")).prefix(8))"
+    check(effectiveCandidates(configDir: "~/.claude", existing: [kcPrefix, defaultHashed]) == [kcPrefix],
+          "bare record wins: stale hashed duplicate never read")
+    check(effectiveCandidates(configDir: "~/.claude", existing: [defaultHashed]) == [defaultHashed],
+          "hashed fallback used only when bare record is absent")
 
     let nested = #"{"claudeAiOauth":{"accessToken":"tok-1","expiresAt":1755600000000}}"#
     let flat = #"{"accessToken":"tok-2"}"#

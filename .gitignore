@@ -1,0 +1,4 @@
+build/
+*.log
+*.png
+.DS_Store

@@ -1,0 +1,7 @@
+{
+  "accounts": [
+    { "name": "Личный Max", "configDir": "~/.claude" },
+    { "name": "Рабочий Team", "configDir": "~/.claude-work" }
+  ],
+  "refreshSeconds": 300
+}

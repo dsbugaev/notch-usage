@@ -1,7 +1,12 @@
 {
   "accounts": [
-    { "name": "Личный Max", "configDir": "~/.claude" },
-    { "name": "Рабочий Team", "configDir": "~/.claude-work" }
+    { "name": "Personal Max", "configDir": "~/.claude" },
+    { "name": "Work Team", "configDir": "~/.claude-work" }
   ],
-  "refreshSeconds": 300
+  "refreshSeconds": 300,
+  "labels": {
+    "five_hour": "5h session",
+    "seven_day": "Week",
+    "seven_day_opus": "Week Opus"
+  }
 }

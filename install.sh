@@ -20,4 +20,4 @@ launchctl bootout "gui/$(id -u)" "$PLIST" 2>/dev/null || true
 pkill -x NotchUsage 2>/dev/null || true
 sleep 1
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
-echo "установлено и запущено (лог: ~/Library/Logs/notchusage.log)"
+echo "installed and started (log: ~/Library/Logs/notchusage.log)"

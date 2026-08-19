@@ -1,42 +1,80 @@
 # NotchUsage
 
-Наводишь курсор на чёлку MacBook — выпадает панель со статусом лимитов по токенам всех подписок Claude: личный Max и рабочий Team, по каждому — сессия 5 часов, неделя (и неделя Opus, если приходит), процент израсходованного и время сброса.
+Hover your cursor over the MacBook notch — a panel drops down with current Claude subscription usage limits for **all your Claude Code profiles at once**: 5-hour session window, weekly window (and Opus weekly where present), percent used and reset time for each account.
 
-## Как работает
-- Официальный эндпоинт Anthropic `api.anthropic.com/api/oauth/usage` — те же цифры, что в `/usage` внутри Claude Code.
-- OAuth-токены читаются из связки ключей macOS (записи `Claude Code-credentials*`, те же, что использует сам Claude Code). Токены никуда, кроме api.anthropic.com, не уходят. Refresh-токен не трогается.
-- Обновление: фоном раз в 5 минут + при наведении, если данные старше минуты.
-- Наведение ловится опросом позиции мыши (80 мс) — Accessibility-разрешение не нужно.
+Built because none of the existing notch trackers support multiple Claude accounts (personal + work via `CLAUDE_CONFIG_DIR`) simultaneously.
 
-## Установка / обновление
+По-русски: [README.ru.md](README.ru.md)
+
+## How it works
+
+- Data comes from the same endpoint Claude Code's own `/usage` screen uses (`api.anthropic.com/api/oauth/usage`).
+- OAuth tokens are read from the macOS Keychain — the same `Claude Code-credentials*` records Claude Code itself maintains. For the default `~/.claude` profile the record is named `Claude Code-credentials`; for a profile selected via `CLAUDE_CONFIG_DIR` it is `Claude Code-credentials-<first 8 hex chars of sha256(configDir)>`.
+- Tokens never leave your machine except to api.anthropic.com. The refresh token is never touched, so Claude Code sessions are never invalidated.
+- Hover detection polls the mouse position (80 ms) against the notch rect — no Accessibility permission needed.
+- Refresh: every 5 minutes in the background, plus on hover when data is older than a minute.
+
+## Requirements
+
+- macOS 13+ (built and tested on macOS 26), Swift toolchain (Xcode or Command Line Tools)
+- A logged-in Claude Code installation (any paid plan)
+
+## Install
+
 ```bash
 ./install.sh
 ```
-Собирает, ставит LaunchAgent (автозапуск при логине) и запускает. **Первый запуск: macOS дважды спросит доступ к связке ключей — жми «Разрешать всегда»** (по разу на каждый профиль). После пересборки бинарника спросит снова (ad-hoc подпись).
 
-## Удаление
-```bash
-./uninstall.sh
+Builds the app, installs a LaunchAgent (starts at login) and launches it. On first run macOS asks for keychain access — one dialog per profile record; choose **Always Allow**. The build is signed with a stable self-signed identity created on first build, so rebuilds don't re-trigger the dialogs.
+
+Update: `git pull && ./install.sh`. Remove: `./uninstall.sh`.
+
+## Configure
+
+`~/.config/notch-usage/config.json` (created from `config.example.json` on first install):
+
+```json
+{
+  "accounts": [
+    { "name": "Personal Max", "configDir": "~/.claude" },
+    { "name": "Work Team", "configDir": "~/.claude-work" }
+  ],
+  "refreshSeconds": 300,
+  "locale": "en_US",
+  "labels": { "five_hour": "5h session", "seven_day": "Week" }
+}
 ```
 
-## Конфиг
-`~/.config/notch-usage/config.json` — список аккаунтов (`name` + `configDir`) и `refreshSeconds`. После правки: `pkill -x NotchUsage` (LaunchAgent перезапустит).
+- `accounts` — one entry per Claude Code profile; `configDir` is the profile's `CLAUDE_CONFIG_DIR` (the default profile is `~/.claude`).
+- `labels` — optional display names for usage windows; unknown API keys are shown raw, and only when non-zero.
+- `locale` — optional locale for reset day/time formatting (defaults to system).
 
-## Диагностика
+After editing: `pkill -x NotchUsage` (the LaunchAgent restarts it).
+
+## Troubleshooting
+
 ```bash
-./build/NotchUsage.app/Contents/MacOS/NotchUsage --print   # статусы в терминал
-./build/NotchUsage.app/Contents/MacOS/NotchUsage --demo    # панель с фейковыми данными на 10 мин
+./build/NotchUsage.app/Contents/MacOS/NotchUsage --print      # statuses to stdout
+./build/NotchUsage.app/Contents/MacOS/NotchUsage --kc-debug   # keychain matching diagnostics (no secrets)
+./build/NotchUsage.app/Contents/MacOS/NotchUsage --selftest   # unit checks for pure functions
+./build/NotchUsage.app/Contents/MacOS/NotchUsage --demo       # panel with fake data
+./build/NotchUsage.app/Contents/MacOS/NotchUsage --show       # force-open the panel once (layout debugging)
 tail -20 ~/Library/Logs/notchusage.log
 ```
 
-## Ошибки в панели
-- «токен истёк — открой Claude Code» — Claude Code давно не запускался и токен в связке ключей протух; любой запуск `claude` его обновит.
-- «доступ к связке ключей запрещён» — нажал «Запретить»; кнопка ⟳ в панели спросит заново.
-- «нет учётки» — в этом профиле не выполнен `/login`.
+Panel messages:
 
-## Ограничения
-- Чёлка есть только на встроенном экране; с закрытой крышкой панель вызывается наведением в верхний центр внешнего монитора (зона 200 пкс).
-- Эндпоинт неофициальный (используется самим Claude Code и всеми трекерами) — при смене формата парсер берёт любые ключи с `utilization`, но может понадобиться правка.
+- *token expired — open Claude Code* — Claude Code hasn't run for a while and the stored access token lapsed; any `claude` launch refreshes it.
+- *keychain access denied* — you clicked Deny; the ⟳ button in the panel re-asks.
+- *no keychain record — run /login* — that profile has never logged in.
+- *keychain record unreadable — re-run /login* — a record exists but holds no parsable token.
+- *keychain error N* — raw OSStatus from the read; decode it with `security error N`.
 
-## Почему своё
-Готовые notch-трекеры 2026 года (claude-notch-tracker, TrayToken, AgentPeek, TokenEater) не умеют две подписки одновременно. Дизайн — `docs/DESIGN.md`.
+## Limitations
+
+- The notch exists only on the built-in display; with the lid closed the hover zone falls back to the top center (200 px) of the main display.
+- The usage endpoint is unofficial (it is what Claude Code itself and every usage tracker uses); if the response format changes, the dynamic parser picks up any object containing `utilization`, but labels may need updating.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

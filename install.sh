@@ -48,7 +48,3 @@ pkill -x NotchUsage 2>/dev/null || true
 sleep 1
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 echo "installed and started (log: ~/Library/Logs/notchusage.log)"
-if ! security dump-trust-settings 2>/dev/null | grep -q "NotchUsage Signing"; then
-  echo "tip: to stop keychain dialogs from reappearing after rebuilds, trust the"
-  echo "     signing certificate once (see README, Install section)"
-fi

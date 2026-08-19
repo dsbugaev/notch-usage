@@ -115,9 +115,38 @@ func keychainReadData(service: String) -> (Data?, OSStatus) {
     return (result as? Data, status)
 }
 
+// Keychain reads go through a separate helper binary that is built once and
+// cached: macOS grants "Always Allow" to that stable file, so rebuilding the
+// main app never re-triggers permission dialogs. Falls back to a direct read
+// when the helper is missing (e.g. running the bare binary from src).
+let helperName = "NotchUsage Credentials"
+
+func keychainReadViaHelper(service: String) -> (Data?, OSStatus)? {
+    let url = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
+        .deletingLastPathComponent().appendingPathComponent(helperName)
+    guard FileManager.default.isExecutableFile(atPath: url.path) else { return nil }
+    let p = Process()
+    p.executableURL = url
+    p.arguments = [service]
+    let out = Pipe()
+    p.standardOutput = out
+    p.standardError = Pipe()
+    do { try p.run() } catch { return nil }
+    // No timeout: the first run sits on the permission dialog until the user
+    // answers; reads are serialized on credsQueue so dialogs come one at a time
+    let data = out.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    switch p.terminationStatus {
+    case 0: return (data, errSecSuccess)
+    case 44: return (nil, errSecUserCanceled)
+    case 45: return (nil, errSecItemNotFound)
+    default: return (nil, errSecIO)
+    }
+}
+
 // Single read+parse step shared by loadCreds and kcDebug so the two never drift
 func tryReadService(_ service: String) -> (creds: Creds?, status: OSStatus, data: Data?) {
-    let (data, status) = keychainReadData(service: service)
+    let (data, status) = keychainReadViaHelper(service: service) ?? keychainReadData(service: service)
     return (data.flatMap(parseCreds), status, data)
 }
 

@@ -25,13 +25,9 @@ Built because none of the existing notch trackers support multiple Claude accoun
 ./install.sh
 ```
 
-Builds the app, installs a LaunchAgent (starts at login) and launches it. On first run macOS asks for keychain access — one dialog per profile record; choose **Always Allow**.
+Builds the app, installs a LaunchAgent (starts at login) and launches it. On first run macOS asks for keychain access — one dialog per profile record, shown as **"NotchUsage Credentials"**; choose **Always Allow** (macOS asks for your login password to persist it).
 
-The build is signed with a stable self-signed identity, but macOS only honors "Always Allow" across rebuilds if it can verify that signature — and a self-signed certificate is untrusted by default, so every rebuild re-triggers the dialogs. To fix that permanently, trust the signing certificate once (asks for your login password one last time):
-
-```bash
-security find-certificate -c "NotchUsage Signing" -p > /tmp/notchusage-cert.pem && security add-trusted-cert -p codeSign -k "$HOME/Library/Keychains/login.keychain-db" /tmp/notchusage-cert.pem && rm /tmp/notchusage-cert.pem
-```
+Keychain reads go through that tiny helper binary, which is built once and cached in `build/NotchUsage Credentials` — updates and rebuilds of the main app never touch it, so macOS never asks again. (Keychain approvals are tied to the exact binary; routing reads through a never-changing helper is what makes them one-time.) Don't delete the cached helper without a reason — a fresh build of it means answering the dialogs once more.
 
 Update: `git pull && ./install.sh`. Remove: `./uninstall.sh`.
 

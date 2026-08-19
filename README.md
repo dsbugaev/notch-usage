@@ -69,6 +69,7 @@ tail -20 ~/Library/Logs/notchusage.log
 
 Panel messages:
 
+- *needs authorization — hover the notch or press ⟳* — Claude Code rotated its token (which also resets the record's "Always Allow" list). Background refreshes never open keychain dialogs; the panel asks for access only when you hover or press ⟳, and keeps showing the last known numbers with this note until then.
 - *token expired — open Claude Code* — Claude Code hasn't run for a while and the stored access token lapsed; any `claude` launch refreshes it.
 - *keychain access denied* — you clicked Deny; the ⟳ button in the panel re-asks.
 - *no keychain record — run /login* — that profile has never logged in.

@@ -412,6 +412,19 @@ func fetchUsage(token: String, labels: [String: String],
 
 // MARK: - Store
 
+// I/O boundaries injected into Store so its behavior is unit-testable
+struct CredsProvider {
+    var listServices: () -> Set<String> = { claudeKeychainServices() }
+    var readFile: (String) -> Creds? = { dir in
+        let url = URL(fileURLWithPath: dir).appendingPathComponent(".credentials.json")
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return parseCreds(data)
+    }
+    var readService: (String) -> (creds: Creds?, status: OSStatus, data: Data?) = { tryReadService($0) }
+}
+
+typealias UsageFetch = (String, [String: String], @escaping ([UsageLine]?, String?, Int?) -> Void) -> Void
+
 final class Store: ObservableObject {
     @Published var statuses: [AccountStatus]
     @Published var refreshing = false
@@ -431,9 +444,16 @@ final class Store: ObservableObject {
     // API says the token died (401) — dialogs then coincide with real rotations.
     private var tokenCache: [String: String] = [:]
 
-    init(cfg: AppConfig, demo: Bool) {
+    let provider: CredsProvider
+    let fetchFn: UsageFetch
+
+    init(cfg: AppConfig, demo: Bool,
+         provider: CredsProvider = CredsProvider(),
+         fetch: @escaping UsageFetch = { fetchUsage(token: $0, labels: $1, completion: $2) }) {
         self.cfg = cfg
         self.demo = demo
+        self.provider = provider
+        self.fetchFn = fetch
         self.labels = defaultLabels.merging(cfg.labels ?? [:]) { _, custom in custom }
         if let id = cfg.locale { appLocale = Locale(identifier: id) }
         if demo {
@@ -457,12 +477,12 @@ final class Store: ObservableObject {
         ]
     }
 
-    func refreshIfStale(maxAge: TimeInterval = 60) {
+    func refreshIfStale(maxAge: TimeInterval = 60, interactive: Bool = false) {
         // Transient errors (e.g. Claude Code rotating a keychain record mid-read)
         // should not stick on screen for the whole refresh interval
         let age = statuses.contains { $0.error != nil } ? min(15, maxAge) : maxAge
         if let lf = lastFetch, Date().timeIntervalSince(lf) < age { return }
-        refresh()
+        refresh(interactive: interactive)
     }
 
     func forceRefresh() {
@@ -471,11 +491,14 @@ final class Store: ObservableObject {
             self.tokenCache.removeAll()
         }
         lastFetch = nil
-        refresh()
+        refresh(interactive: true)
     }
 
-    // Called from the main thread (timers, hover, the ⟳ button, runPrint)
-    func refresh() {
+    // Called from the main thread (timers, hover, the ⟳ button, runPrint).
+    // interactive=true marks a deliberate user action: only then may the
+    // keychain be read (and its permission dialog shown). Background cycles
+    // live off the in-memory token cache.
+    func refresh(interactive: Bool = false) {
         if demo { return }
         lastFetch = Date()
         refreshing = true
@@ -485,10 +508,11 @@ final class Store: ObservableObject {
         let group = DispatchGroup()
         for _ in accounts { group.enter() }
         credsQueue.async {
-            let existing = claudeKeychainServices()
+            let existing = self.provider.listServices()
             for (idx, acct) in accounts.enumerated() {
                 self.fetchAccount(idx: idx, acct: acct, existing: existing, gen: gen,
-                                  labels: labelsSnapshot, allowRetry: true) {
+                                  labels: labelsSnapshot, interactive: interactive,
+                                  allowRetry: true) {
                     group.leave()
                 }
             }
@@ -498,10 +522,10 @@ final class Store: ObservableObject {
 
     // credsQueue only
     private func fetchAccount(idx: Int, acct: AccountConfig, existing: Set<String>, gen: Int,
-                              labels: [String: String], allowRetry: Bool,
+                              labels: [String: String], interactive: Bool, allowRetry: Bool,
                               done: @escaping () -> Void) {
         let dir = expandPath(acct.configDir)
-        let (creds, credErr) = loadCreds(acct: acct, existing: existing)
+        let (creds, credErr) = loadCreds(acct: acct, existing: existing, interactive: interactive)
         guard let creds else {
             DispatchQueue.main.async {
                 if self.generation == gen { self.statuses[idx].error = credErr }
@@ -509,14 +533,15 @@ final class Store: ObservableObject {
             }
             return
         }
-        fetchUsage(token: creds.accessToken, labels: labels) { lines, err, http in
+        fetchFn(creds.accessToken, labels) { lines, err, http in
             if http == 401, allowRetry {
                 // The cached token died (Claude rotated it) — drop it and
                 // re-read the keychain once
                 self.credsQueue.async {
                     self.tokenCache[dir] = nil
                     self.fetchAccount(idx: idx, acct: acct, existing: existing, gen: gen,
-                                      labels: labels, allowRetry: false, done: done)
+                                      labels: labels, interactive: interactive,
+                                      allowRetry: false, done: done)
                 }
                 return
             }
@@ -554,28 +579,35 @@ final class Store: ObservableObject {
             return AccountStatus(name: acct.name)
         }
         lastFetch = nil
-        refresh()
+        // A config edit is a deliberate user action
+        refresh(interactive: true)
     }
 
-    // Resolve one account's credentials on credsQueue and hand them to the callback
+    // Resolve one account's credentials on credsQueue and hand them to the
+    // callback (terminal diagnostics are a deliberate user action)
     func withCreds(acct: AccountConfig, _ body: @escaping (Creds?, String?) -> Void) {
         credsQueue.async {
-            let existing = claudeKeychainServices()
-            let (creds, err) = self.loadCreds(acct: acct, existing: existing)
+            let existing = self.provider.listServices()
+            let (creds, err) = self.loadCreds(acct: acct, existing: existing, interactive: true)
             body(creds, err)
         }
     }
 
     // credsQueue only
-    private func loadCreds(acct: AccountConfig, existing: Set<String>) -> (Creds?, String?) {
+    private func loadCreds(acct: AccountConfig, existing: Set<String>,
+                           interactive: Bool) -> (Creds?, String?) {
         let dir = expandPath(acct.configDir)
         if let cached = tokenCache[dir] { return (Creds(accessToken: cached), nil) }
         // A .credentials.json file inside the profile dir wins over the keychain
-        // (mirrors Claude Code's own lookup order)
-        let fileURL = URL(fileURLWithPath: dir).appendingPathComponent(".credentials.json")
-        if let data = try? Data(contentsOf: fileURL), let c = parseCreds(data) {
+        // (mirrors Claude Code's own lookup order); file reads never prompt
+        if let c = provider.readFile(dir) {
             tokenCache[dir] = c.accessToken
             return (c, nil)
+        }
+        // Keychain reads can pop a permission dialog (Claude resets the ACL on
+        // every token rotation) — only a deliberate user action may trigger one
+        guard interactive else {
+            return (nil, "needs authorization — hover the notch or press ⟳")
         }
 
         let candidates = effectiveCandidates(configDir: dir, existing: existing)
@@ -589,7 +621,7 @@ final class Store: ObservableObject {
                 denied = true
                 continue
             }
-            let r = tryReadService(service)
+            let r = provider.readService(service)
             if let c = r.creds {
                 tokenCache[dir] = c.accessToken
                 return (c, nil)
@@ -697,17 +729,25 @@ struct PanelView: View {
                         .foregroundColor(Color.white.opacity(0.35))
                 }
             }
-            if let e = st.error {
+            if !st.lines.isEmpty {
+                // Stale data beats a bare error: keep the last numbers visible
+                ForEach(panelVisibleLines(st.lines)) { line in lineView(line) }
+                if let e = st.error {
+                    Text(e)
+                        .font(.system(size: 9))
+                        .foregroundColor(Color.orange.opacity(0.85))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                }
+            } else if let e = st.error {
                 Text(e)
                     .font(.system(size: 11))
                     .foregroundColor(Color.orange.opacity(0.9))
                     .fixedSize(horizontal: false, vertical: true)
-            } else if st.lines.isEmpty {
+            } else {
                 Text("loading…")
                     .font(.system(size: 11))
                     .foregroundColor(.gray)
-            } else {
-                ForEach(panelVisibleLines(st.lines)) { line in lineView(line) }
             }
         }
     }
@@ -990,7 +1030,9 @@ final class NotchController: NSObject {
         expanded = true
         enterTicks = 0
         exitTicks = 0
-        store.refreshIfStale()
+        // Hovering is a deliberate user action: keychain access (and its
+        // permission dialog, when Claude has rotated the token) is allowed
+        store.refreshIfStale(interactive: true)
         layoutAndShow()
     }
 
@@ -1083,7 +1125,7 @@ func runRaw(cfg: AppConfig) {
 
 func runPrint(cfg: AppConfig) {
     let store = Store(cfg: cfg, demo: false)
-    store.refresh()
+    store.refresh(interactive: true)
     let deadline = Date().addingTimeInterval(45)
     while Date() < deadline {
         RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.2))
@@ -1187,6 +1229,109 @@ func runSelfTest() -> Int {
        let tomorrowNoon = Calendar.current.date(bySettingHour: 12, minute: 0, second: 0, of: t1) {
         check(fmtReset(tomorrowNoon).hasPrefix("→ "), "fmtReset tomorrow branch")
     }
+
+    // --- Store behavior (seam: refresh(interactive:) + statuses; keychain/network faked) ---
+
+    final class TestEnv {
+        let lock = NSLock()
+        var keychainReads = 0
+        var fetchCalls = 0
+        var lastToken: String? = nil
+        var responses: [([UsageLine]?, String?, Int?)] = []
+        func snapshot() -> (reads: Int, fetches: Int, token: String?) {
+            lock.lock()
+            defer { lock.unlock() }
+            return (keychainReads, fetchCalls, lastToken)
+        }
+    }
+
+    func makeStore(_ env: TestEnv) -> Store {
+        var p = CredsProvider()
+        p.listServices = { [kcPrefix] }
+        p.readFile = { _ in nil }
+        p.readService = { _ in
+            env.lock.lock()
+            env.keychainReads += 1
+            let n = env.keychainReads
+            env.lock.unlock()
+            return (Creds(accessToken: "tok-\(n)"), errSecSuccess, Data([1]))
+        }
+        let cfg = AppConfig(accounts: [AccountConfig(name: "T", configDir: "~/.claude")],
+                            refreshSeconds: 300)
+        return Store(cfg: cfg, demo: false, provider: p, fetch: { token, _, completion in
+            env.lock.lock()
+            env.fetchCalls += 1
+            env.lastToken = token
+            let resp = env.responses.isEmpty
+                ? ([UsageLine(label: "L", pct: 1, resetText: "")], nil, Optional(200))
+                : env.responses.removeFirst()
+            env.lock.unlock()
+            completion(resp.0, resp.1, resp.2)
+        })
+    }
+
+    func spin(_ cond: () -> Bool, _ timeout: TimeInterval = 3) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+            if cond() { return true }
+        }
+        return cond()
+    }
+
+    // S1: a background refresh with no cached token must not touch the keychain
+    let env1 = TestEnv()
+    let store1 = makeStore(env1)
+    store1.refresh(interactive: false)
+    check(spin({ store1.statuses[0].error != nil }), "S1: background refresh reports an error state")
+    check(env1.snapshot().reads == 0, "S1: background refresh performed no keychain reads")
+    check(store1.statuses[0].error?.contains("authorization") == true, "S1: error asks for authorization")
+
+    // S2: an interactive refresh reads the keychain once and shows data
+    let env2 = TestEnv()
+    let store2 = makeStore(env2)
+    store2.refresh(interactive: true)
+    check(spin({ !store2.statuses[0].lines.isEmpty }), "S2: interactive refresh loads data")
+    check(env2.snapshot().reads == 1, "S2: exactly one keychain read")
+    check(env2.snapshot().token == "tok-1", "S2: fetch used the token from the keychain")
+    check(store2.statuses[0].error == nil, "S2: no error after success")
+
+    // S3: the next background refresh runs off the cached token, no keychain reads
+    store2.refresh(interactive: false)
+    check(spin({ env2.snapshot().fetches == 2 }), "S3: background refresh fetched via cache")
+    check(env2.snapshot().reads == 1, "S3: keychain read count unchanged")
+    check(env2.snapshot().token == "tok-1", "S3: cached token reused")
+
+    // S4: a background 401 (token rotated) must not read the keychain and
+    // must keep the stale data visible
+    env2.lock.lock()
+    env2.responses = [(nil, "token expired — open Claude Code", 401)]
+    env2.lock.unlock()
+    store2.refresh(interactive: false)
+    check(spin({ store2.statuses[0].error != nil }), "S4: background 401 surfaces an error")
+    check(store2.statuses[0].error?.contains("authorization") == true, "S4: error asks for authorization")
+    check(env2.snapshot().reads == 1, "S4: still no extra keychain reads in background")
+    check(!store2.statuses[0].lines.isEmpty, "S4: stale data kept alongside the error")
+
+    // S5: an interactive 401 re-reads the keychain once and retries with the fresh token
+    let env5 = TestEnv()
+    env5.responses = [(nil, "token expired — open Claude Code", 401),
+                      ([UsageLine(label: "L2", pct: 7, resetText: "")], nil, 200)]
+    let store5 = makeStore(env5)
+    store5.refresh(interactive: true)
+    check(spin({ store5.statuses[0].lines.first?.label == "L2" }), "S5: retry succeeded with fresh token")
+    check(env5.snapshot().reads == 2, "S5: exactly one re-read after 401")
+    check(env5.snapshot().token == "tok-2", "S5: retry used the fresh token")
+    check(store5.statuses[0].error == nil, "S5: no error after successful retry")
+
+    // S6: two 401s in a row stop after one retry and keep the error, no loop
+    let env6 = TestEnv()
+    env6.responses = [(nil, "token expired — open Claude Code", 401),
+                      (nil, "token expired — open Claude Code", 401)]
+    let store6 = makeStore(env6)
+    store6.refresh(interactive: true)
+    check(spin({ store6.statuses[0].error != nil }), "S6: second 401 surfaces the error")
+    check(env6.snapshot().fetches == 2 && env6.snapshot().reads == 2, "S6: exactly one retry, then stop")
 
     print(failures == 0 ? "SELFTEST PASSED" : "SELFTEST FAILED: \(failures)")
     return failures

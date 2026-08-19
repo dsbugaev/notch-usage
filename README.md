@@ -55,7 +55,7 @@ Update: `git pull && ./install.sh`. Remove: `./uninstall.sh`.
 - `labels` — optional display names for usage windows. Keys are the `kind` values of the API's `limits` array (`session`, `weekly_all`, `weekly_scoped:<Model>`); unknown windows are shown with raw keys, and only when non-zero.
 - `locale` — optional locale for reset day/time formatting (defaults to system).
 
-After editing: `pkill -x NotchUsage` (the LaunchAgent restarts it).
+The gear button in the panel opens this file in your editor; saved changes are picked up automatically within a second — no restart needed.
 
 ## Troubleshooting
 

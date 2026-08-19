@@ -2,6 +2,7 @@ import AppKit
 import SwiftUI
 import Security
 import CryptoKit
+import Combine
 
 // MARK: - Config
 
@@ -39,6 +40,20 @@ func loadConfig() -> AppConfig {
     return AppConfig(accounts: [
         AccountConfig(name: "Claude", configDir: "~/.claude"),
     ], refreshSeconds: 300)
+}
+
+// The gear button: reveal the config in the default editor, creating it first
+// if the app was launched without install.sh ever generating one
+func openConfigInEditor() {
+    let url = configURL()
+    if !FileManager.default.fileExists(atPath: url.path) {
+        try? FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.prettyPrinted]
+        if let data = try? enc.encode(loadConfig()) { try? data.write(to: url) }
+    }
+    NSWorkspace.shared.open(url)
 }
 
 // MARK: - Credentials
@@ -357,9 +372,11 @@ func fetchUsage(token: String, labels: [String: String], completion: @escaping (
 final class Store: ObservableObject {
     @Published var statuses: [AccountStatus]
     @Published var refreshing = false
-    let cfg: AppConfig
+    private(set) var cfg: AppConfig
     let demo: Bool
-    let labels: [String: String]
+    private(set) var labels: [String: String]
+    // Bumped on config reload; in-flight fetches from older generations are dropped
+    private var generation = 0
     private var lastFetch: Date? = nil
     // All keychain access is serialized on credsQueue: deniedServices is only
     // touched there, and first-run permission dialogs appear one at a time
@@ -393,7 +410,10 @@ final class Store: ObservableObject {
     }
 
     func refreshIfStale(maxAge: TimeInterval = 60) {
-        if let lf = lastFetch, Date().timeIntervalSince(lf) < maxAge { return }
+        // Transient errors (e.g. Claude Code rotating a keychain record mid-read)
+        // should not stick on screen for the whole refresh interval
+        let age = statuses.contains { $0.error != nil } ? min(15, maxAge) : maxAge
+        if let lf = lastFetch, Date().timeIntervalSince(lf) < age { return }
         refresh()
     }
 
@@ -408,27 +428,32 @@ final class Store: ObservableObject {
         if demo { return }
         lastFetch = Date()
         refreshing = true
+        let gen = generation
+        let accounts = cfg.accounts
+        let labelsSnapshot = labels
         let group = DispatchGroup()
-        for _ in cfg.accounts { group.enter() }
+        for _ in accounts { group.enter() }
         credsQueue.async {
             let existing = claudeKeychainServices()
-            for (idx, acct) in self.cfg.accounts.enumerated() {
+            for (idx, acct) in accounts.enumerated() {
                 let (creds, credErr) = self.loadCreds(acct: acct, existing: existing)
                 guard let creds else {
                     DispatchQueue.main.async {
-                        self.statuses[idx].error = credErr
+                        if self.generation == gen { self.statuses[idx].error = credErr }
                         group.leave()
                     }
                     continue
                 }
-                fetchUsage(token: creds.accessToken, labels: self.labels) { lines, err in
+                fetchUsage(token: creds.accessToken, labels: labelsSnapshot) { lines, err in
                     DispatchQueue.main.async {
-                        if let lines {
-                            self.statuses[idx].lines = lines
-                            self.statuses[idx].error = nil
-                            self.statuses[idx].updatedAt = Date()
-                        } else {
-                            self.statuses[idx].error = err ?? "unknown error"
+                        if self.generation == gen {
+                            if let lines {
+                                self.statuses[idx].lines = lines
+                                self.statuses[idx].error = nil
+                                self.statuses[idx].updatedAt = Date()
+                            } else {
+                                self.statuses[idx].error = err ?? "unknown error"
+                            }
                         }
                         group.leave()
                     }
@@ -436,6 +461,28 @@ final class Store: ObservableObject {
             }
         }
         group.notify(queue: .main) { self.refreshing = false }
+    }
+
+    // Hot config reload: keep already-loaded data for profiles that stayed
+    func applyConfig(_ newCfg: AppConfig) {
+        if demo { return }
+        var byDir: [String: AccountStatus] = [:]
+        for (i, acct) in cfg.accounts.enumerated() where i < statuses.count {
+            byDir[expandPath(acct.configDir)] = statuses[i]
+        }
+        cfg = newCfg
+        labels = defaultLabels.merging(newCfg.labels ?? [:]) { _, custom in custom }
+        appLocale = newCfg.locale.map { Locale(identifier: $0) } ?? Locale.current
+        generation += 1
+        statuses = newCfg.accounts.map { acct in
+            if let old = byDir[expandPath(acct.configDir)] {
+                return AccountStatus(name: acct.name, lines: old.lines,
+                                     error: old.error, updatedAt: old.updatedAt)
+            }
+            return AccountStatus(name: acct.name)
+        }
+        lastFetch = nil
+        refresh()
     }
 
     // Resolve one account's credentials on credsQueue and hand them to the callback
@@ -540,6 +587,9 @@ struct PanelView: View {
             RoundedRectangle(cornerRadius: 20, style: .continuous)
                 .stroke(Color.white.opacity(0.12), lineWidth: 1)
         )
+        // Never let layout measurement compress the panel vertically — an
+        // undersized window clips the footer and the bottom rounding
+        .fixedSize(horizontal: false, vertical: true)
     }
 
     func accountView(_ st: AccountStatus) -> some View {
@@ -600,11 +650,17 @@ struct PanelView: View {
     }
 
     var footer: some View {
-        HStack {
+        HStack(spacing: 12) {
             Text(store.refreshing ? "updating…" : "NotchUsage")
                 .font(.system(size: 9))
                 .foregroundColor(Color.white.opacity(0.3))
             Spacer()
+            Button { openConfigInEditor() } label: {
+                Image(systemName: "gearshape")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(Color.white.opacity(0.6))
+            }
+            .buttonStyle(.plain)
             Button { store.forceRefresh() } label: {
                 Image(systemName: "arrow.clockwise")
                     .font(.system(size: 10, weight: .medium))
@@ -654,6 +710,10 @@ final class NotchController: NSObject {
     var notch: NSRect = .zero
     var screenTop: CGFloat = 0
     var forcedUntil: Date? = nil
+    var configSource: DispatchSourceFileSystemObject?
+    var reloadPending = false
+    var topInsetValue: CGFloat = 8
+    var statusesSub: AnyCancellable?
 
     init(store: Store) {
         self.store = store
@@ -719,7 +779,8 @@ final class NotchController: NSObject {
             }
             notch = NSRect(x: x, y: s.frame.maxY - inset, width: w, height: inset)
             screenTop = s.frame.maxY
-            hosting.rootView = ContainerView(store: store, topInset: inset + 6)
+            topInsetValue = inset + 6
+            hosting.rootView = ContainerView(store: store, topInset: topInsetValue)
             NSLog("notch rect: %@", NSStringFromRect(notch))
             return
         }
@@ -728,7 +789,8 @@ final class NotchController: NSObject {
             notch = NSRect(x: s.frame.midX - PanelMetrics.fallbackZoneWidth / 2, y: s.frame.maxY - 2,
                            width: PanelMetrics.fallbackZoneWidth, height: 2)
             screenTop = s.frame.maxY
-            hosting.rootView = ContainerView(store: store, topInset: 8)
+            topInsetValue = 8
+            hosting.rootView = ContainerView(store: store, topInset: topInsetValue)
             NSLog("no notch, fallback zone: %@", NSStringFromRect(notch))
         }
     }
@@ -737,14 +799,63 @@ final class NotchController: NSObject {
         let poll = Timer(timeInterval: 0.08, repeats: true) { [weak self] _ in self?.tick() }
         RunLoop.main.add(poll, forMode: .common)
         pollTimer = poll
-        let interval = max(store.cfg.refreshSeconds ?? 300, 60)
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
-            self?.store.refresh()
-        }
+        restartRefreshTimer()
+        watchConfig()
+        statusesSub = store.objectWillChange
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                DispatchQueue.main.async { self?.relayoutIfNeeded() }
+            }
         store.refresh()
         if showNow {
             forcedUntil = Date().addingTimeInterval(store.demo ? 600 : 15)
             expand()
+        }
+    }
+
+    func restartRefreshTimer() {
+        refreshTimer?.invalidate()
+        let interval = max(store.cfg.refreshSeconds ?? 300, 60)
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            self?.store.refresh()
+        }
+    }
+
+    // Watch the config file and hot-apply edits (editors atomic-save via
+    // rename, so re-subscribe when the inode goes away)
+    func watchConfig() {
+        configSource?.cancel()
+        configSource = nil
+        let fd = open(configURL().path, O_EVTONLY)
+        guard fd >= 0 else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in self?.watchConfig() }
+            return
+        }
+        let src = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd, eventMask: [.write, .extend, .delete, .rename], queue: .main)
+        src.setEventHandler { [weak self] in
+            guard let self else { return }
+            let events = src.data
+            self.scheduleConfigReload()
+            if events.contains(.delete) || events.contains(.rename) {
+                self.watchConfig()
+            }
+        }
+        src.setCancelHandler { close(fd) }
+        src.resume()
+        configSource = src
+    }
+
+    func scheduleConfigReload() {
+        guard !reloadPending else { return }
+        reloadPending = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+            guard let self else { return }
+            self.reloadPending = false
+            self.store.applyConfig(loadConfig())
+            self.restartRefreshTimer()
+            if self.expanded { self.layoutAndShow() }
+            NSLog("config reloaded")
         }
     }
 
@@ -793,11 +904,21 @@ final class NotchController: NSObject {
         layoutAndShow()
     }
 
+    // NSHostingView's fittingSize/intrinsicContentSize misreport for this
+    // content; NSHostingController.sizeThatFits measures it reliably.
+    // Propose zero height: the bottom Spacer collapses while the panel's
+    // fixedSize keeps its natural height, so the result is exactly the content
+    func desiredSize() -> NSSize {
+        let ideal = NSHostingController(rootView: ContainerView(store: store, topInset: topInsetValue))
+            .sizeThatFits(in: NSSize(width: PanelMetrics.containerWidth, height: 0))
+        var size = NSSize(width: PanelMetrics.containerWidth, height: ideal.height)
+        NSLog("measure ideal=%@", NSStringFromSize(ideal))
+        if size.height < 120 || size.height > 900 { size.height = 520 }
+        return size
+    }
+
     func layoutAndShow() {
-        hosting.layoutSubtreeIfNeeded()
-        var size = hosting.fittingSize
-        if size.width < PanelMetrics.containerWidth { size.width = PanelMetrics.containerWidth }
-        if size.height < 60 { size.height = 200 }
+        let size = desiredSize()
         let x = (notch != .zero ? notch.midX : screenTop) - size.width / 2
         let y = screenTop - size.height
         window.setFrame(NSRect(x: x, y: y, width: size.width, height: size.height), display: true)
@@ -808,6 +929,20 @@ final class NotchController: NSObject {
             window.animator().alphaValue = 1
         }
         NSLog("expanded: %@", NSStringFromRect(window.frame))
+    }
+
+    // Content height changes while the panel is open (data arrives after the
+    // loading state, config reloads) — re-fit the window, keeping the top pinned
+    func relayoutIfNeeded() {
+        guard expanded else { return }
+        let size = desiredSize()
+        if abs(size.height - window.frame.height) > 2 {
+            let x = (notch != .zero ? notch.midX : screenTop) - size.width / 2
+            window.setFrame(
+                NSRect(x: x, y: screenTop - size.height, width: size.width, height: size.height),
+                display: true
+            )
+        }
     }
 
     func collapse() {

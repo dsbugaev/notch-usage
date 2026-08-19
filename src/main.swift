@@ -257,9 +257,24 @@ func parseUsage(_ obj: [String: Any], labels: [String: String]) -> [UsageLine] {
     return lines
 }
 
-// Fallback snapshot; detectCLIVersion() replaces it at startup with the
-// installed CLI's real version (the endpoint throttles unknown user agents)
-var userAgent = "claude-code/2.1.235"
+// Fallback snapshot; detectCLIVersion() replaces it with the installed CLI's
+// real version (the endpoint throttles unknown user agents). Thread-safe:
+// detection runs on a background queue while fetches read from credsQueue.
+final class UserAgentHolder {
+    private var value = "claude-code/2.1.235"
+    private let lock = NSLock()
+    var current: String {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+    func set(_ v: String) {
+        lock.lock()
+        value = v
+        lock.unlock()
+    }
+}
+let userAgentHolder = UserAgentHolder()
 
 func runProcess(_ path: String, _ args: [String], timeout: TimeInterval = 5) -> String? {
     let p = Process()
@@ -300,14 +315,14 @@ func detectCLIVersion() {
     guard let bin,
           let ver = runProcess(bin, ["--version"]),
           let range = ver.range(of: #"\d+\.\d+\.\d+"#, options: .regularExpression) else { return }
-    userAgent = "claude-code/\(ver[range])"
+    userAgentHolder.set("claude-code/\(ver[range])")
 }
 
 func fetchUsage(token: String, labels: [String: String], completion: @escaping ([UsageLine]?, String?) -> Void) {
     var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
     req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
     req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
-    req.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+    req.setValue(userAgentHolder.current, forHTTPHeaderField: "User-Agent")
     req.timeoutInterval = 15
     URLSession.shared.dataTask(with: req) { data, resp, err in
         if let err = err {
@@ -823,7 +838,7 @@ func runRaw(cfg: AppConfig) {
             var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
             req.setValue("Bearer \(creds.accessToken)", forHTTPHeaderField: "Authorization")
             req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
-            req.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+            req.setValue(userAgentHolder.current, forHTTPHeaderField: "User-Agent")
             URLSession.shared.dataTask(with: req) { data, resp, _ in
                 let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
                 let body = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
@@ -952,7 +967,9 @@ func runSelfTest() -> Int {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var controller: NotchController?
     func applicationDidFinishLaunching(_ notification: Notification) {
-        detectCLIVersion()
+        // Async: the CLI (node) can take seconds to answer --version; the panel
+        // must not wait, the first fetch just uses the fallback UA
+        DispatchQueue.global(qos: .utility).async { detectCLIVersion() }
         let demo = CommandLine.arguments.contains("--demo")
         let store = Store(cfg: loadConfig(), demo: demo)
         let c = NotchController(store: store)

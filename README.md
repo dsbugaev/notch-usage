@@ -1,6 +1,6 @@
 # NotchUsage
 
-Hover your cursor over the MacBook notch — a panel drops down with current Claude subscription usage limits for **all your Claude Code profiles at once**: 5-hour session window, weekly window (and Opus weekly where present), percent used and reset time for each account.
+Hover your cursor over the MacBook notch — a panel drops down with current Claude subscription usage limits for **all your Claude Code profiles at once**: 5-hour session window, weekly window, per-model weekly windows (the "Fable | All models" split), percent used and reset time for each account.
 
 Built because none of the existing notch trackers support multiple Claude accounts (personal + work via `CLAUDE_CONFIG_DIR`) simultaneously.
 
@@ -31,7 +31,7 @@ Update: `git pull && ./install.sh`. Remove: `./uninstall.sh`.
 
 ## Configure
 
-`~/.config/notch-usage/config.json` (created from `config.example.json` on first install):
+`~/.config/notch-usage/config.json` — generated on first install from the Claude profile directories that actually exist on your machine (`~/.claude` plus any `~/.claude-*` with a profile marker), so a single-profile setup gets a single account out of the box. Edit to rename accounts, drop entries, or add labels (full format in `config.example.json`):
 
 ```json
 {
@@ -41,12 +41,12 @@ Update: `git pull && ./install.sh`. Remove: `./uninstall.sh`.
   ],
   "refreshSeconds": 300,
   "locale": "en_US",
-  "labels": { "five_hour": "5h session", "seven_day": "Week" }
+  "labels": { "session": "5h session", "weekly_all": "Week (all)", "weekly_scoped:Fable": "Week Fable" }
 }
 ```
 
 - `accounts` — one entry per Claude Code profile; `configDir` is the profile's `CLAUDE_CONFIG_DIR` (the default profile is `~/.claude`).
-- `labels` — optional display names for usage windows; unknown API keys are shown raw, and only when non-zero.
+- `labels` — optional display names for usage windows. Keys are the `kind` values of the API's `limits` array (`session`, `weekly_all`, `weekly_scoped:<Model>`); unknown windows are shown with raw keys, and only when non-zero.
 - `locale` — optional locale for reset day/time formatting (defaults to system).
 
 After editing: `pkill -x NotchUsage` (the LaunchAgent restarts it).
@@ -56,6 +56,7 @@ After editing: `pkill -x NotchUsage` (the LaunchAgent restarts it).
 ```bash
 ./build/NotchUsage.app/Contents/MacOS/NotchUsage --print      # statuses to stdout
 ./build/NotchUsage.app/Contents/MacOS/NotchUsage --kc-debug   # keychain matching diagnostics (no secrets)
+./build/NotchUsage.app/Contents/MacOS/NotchUsage --raw        # raw usage-endpoint response per account
 ./build/NotchUsage.app/Contents/MacOS/NotchUsage --selftest   # unit checks for pure functions
 ./build/NotchUsage.app/Contents/MacOS/NotchUsage --demo       # panel with fake data
 ./build/NotchUsage.app/Contents/MacOS/NotchUsage --show       # force-open the panel once (layout debugging)

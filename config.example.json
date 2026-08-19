@@ -4,9 +4,10 @@
     { "name": "Work Team", "configDir": "~/.claude-work" }
   ],
   "refreshSeconds": 300,
+  "locale": "en_US",
   "labels": {
-    "five_hour": "5h session",
-    "seven_day": "Week",
-    "seven_day_opus": "Week Opus"
+    "session": "5h session",
+    "weekly_all": "Week (all)",
+    "weekly_scoped:Fable": "Week Fable"
   }
 }

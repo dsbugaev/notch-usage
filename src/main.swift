@@ -113,6 +113,13 @@ struct UsageLine: Identifiable {
     let label: String
     let pct: Int
     let resetText: String
+    var known = true
+}
+
+// The panel hides unrecognized zero buckets (internal/experimental API keys);
+// --print always shows everything, so new buckets are discoverable
+func panelVisibleLines(_ lines: [UsageLine]) -> [UsageLine] {
+    lines.filter { $0.known || $0.pct >= 1 }
 }
 
 struct AccountStatus: Identifiable {
@@ -156,11 +163,11 @@ func fmtReset(_ d: Date) -> String {
     return "→ \(wd.string(from: d))"
 }
 
-// Known usage buckets, in display order. Unknown buckets (internal/experimental
-// keys the API may add) are shown with their raw key name, and only when non-zero.
+// Known usage buckets, in display order. Unknown buckets the API may add are
+// kept with their raw key name; the panel shows them only when non-zero.
 let knownBuckets: [(key: String, label: String)] = [
     ("five_hour", "5h session"),
-    ("seven_day", "Week"),
+    ("seven_day", "Week (all)"),
     ("seven_day_opus", "Week Opus"),
     ("seven_day_sonnet", "Week Sonnet"),
     ("seven_day_oauth_apps", "Week (apps)"),
@@ -176,10 +183,56 @@ func makeLine(key: String, dict: [String: Any], labels: [String: String]) -> Usa
     var resetText = ""
     if let rs = dict["resets_at"] as? String, let d = parseISO(rs) { resetText = fmtReset(d) }
     let label = labels[key] ?? defaultLabels[key] ?? key
-    return UsageLine(label: label, pct: Int(min(max(u.rounded(), 0), 999)), resetText: resetText)
+    return UsageLine(label: label, pct: Int(min(max(u.rounded(), 0), 999)), resetText: resetText,
+                     known: defaultLabels[key] != nil || labels[key] != nil)
+}
+
+// Labels for entries of the "limits" array; scoped windows get "<kind>:<model>"
+// keys so configs can override them precisely (e.g. "weekly_scoped:Fable")
+let knownLimitKinds: Set<String> = ["session", "weekly_all", "weekly_scoped"]
+let legacyLabelKeys = ["session": "five_hour", "weekly_all": "seven_day"]
+
+func defaultLimitLabel(kind: String, scopeName: String?) -> String {
+    switch kind {
+    case "session": return "5h session"
+    case "weekly_all": return "Week (all)"
+    case "weekly_scoped": return scopeName.map { "Week \($0)" } ?? "Week (scoped)"
+    default: return scopeName.map { "\(kind) \($0)" } ?? kind
+    }
+}
+
+// Preferred source: the "limits" array — unlike the flat top-level buckets it
+// carries per-model scoped weekly windows (the Fable | All models split)
+func parseLimitsArray(_ obj: [String: Any], labels: [String: String]) -> [UsageLine] {
+    guard let arr = obj["limits"] as? [[String: Any]] else { return [] }
+    var lines: [UsageLine] = []
+    for item in arr {
+        guard let kind = item["kind"] as? String,
+              let n = item["percent"] as? NSNumber else { continue }
+        let u = n.doubleValue
+        guard u.isFinite else { continue }
+        var scopeName: String? = nil
+        if let scope = item["scope"] as? [String: Any],
+           let model = scope["model"] as? [String: Any],
+           let dn = model["display_name"] as? String, !dn.isEmpty {
+            scopeName = dn
+        }
+        let key = scopeName.map { "\(kind):\($0)" } ?? kind
+        var resetText = ""
+        if let rs = item["resets_at"] as? String, let d = parseISO(rs) { resetText = fmtReset(d) }
+        let label = labels[key] ?? labels[kind]
+            ?? legacyLabelKeys[kind].flatMap { labels[$0] }
+            ?? defaultLimitLabel(kind: kind, scopeName: scopeName)
+        lines.append(UsageLine(label: label, pct: Int(min(max(u.rounded(), 0), 999)),
+                               resetText: resetText, known: knownLimitKinds.contains(kind)))
+    }
+    return lines
 }
 
 func parseUsage(_ obj: [String: Any], labels: [String: String]) -> [UsageLine] {
+    let fromLimits = parseLimitsArray(obj, labels: labels)
+    if !fromLimits.isEmpty { return fromLimits }
+
     var lines: [UsageLine] = []
     var used = Set<String>()
     for key in knownKeyOrder {
@@ -191,7 +244,7 @@ func parseUsage(_ obj: [String: Any], labels: [String: String]) -> [UsageLine] {
     for (key, val) in obj.sorted(by: { $0.key < $1.key }) {
         guard !used.contains(key), let d = val as? [String: Any],
               let line = makeLine(key: key, dict: d, labels: labels) else { continue }
-        if line.pct >= 1 { lines.append(line) }
+        lines.append(line)
     }
     if lines.isEmpty {
         for (_, val) in obj {
@@ -314,12 +367,12 @@ final class Store: ObservableObject {
         [
             AccountStatus(name: "Personal Max", lines: [
                 UsageLine(label: "5h session", pct: 42, resetText: "→ 19:00"),
-                UsageLine(label: "Week", pct: 63, resetText: "→ Thu 07:00"),
-                UsageLine(label: "Week Opus", pct: 88, resetText: "→ Thu 07:00"),
+                UsageLine(label: "Week (all)", pct: 63, resetText: "→ Thu 07:00"),
+                UsageLine(label: "Week Fable", pct: 88, resetText: "→ Thu 07:00"),
             ], updatedAt: Date()),
             AccountStatus(name: "Work Team", lines: [
                 UsageLine(label: "5h session", pct: 12, resetText: "→ 21:30"),
-                UsageLine(label: "Week", pct: 55, resetText: "→ Fri 10:00"),
+                UsageLine(label: "Week (all)", pct: 55, resetText: "→ Fri 10:00"),
             ], updatedAt: Date()),
         ]
     }
@@ -368,6 +421,15 @@ final class Store: ObservableObject {
             }
         }
         group.notify(queue: .main) { self.refreshing = false }
+    }
+
+    // Resolve one account's credentials on credsQueue and hand them to the callback
+    func withCreds(acct: AccountConfig, _ body: @escaping (Creds?, String?) -> Void) {
+        credsQueue.async {
+            let existing = claudeKeychainServices()
+            let (creds, err) = self.loadCreds(acct: acct, existing: existing)
+            body(creds, err)
+        }
     }
 
     // credsQueue only
@@ -491,7 +553,7 @@ struct PanelView: View {
                     .font(.system(size: 11))
                     .foregroundColor(.gray)
             } else {
-                ForEach(st.lines) { line in lineView(line) }
+                ForEach(panelVisibleLines(st.lines)) { line in lineView(line) }
             }
         }
     }
@@ -745,6 +807,38 @@ final class NotchController: NSObject {
     }
 }
 
+// MARK: - --raw mode (dump the endpoint response as-is, no parsing)
+
+func runRaw(cfg: AppConfig) {
+    let store = Store(cfg: cfg, demo: false)
+    let group = DispatchGroup()
+    for acct in cfg.accounts {
+        group.enter()
+        store.withCreds(acct: acct) { creds, err in
+            guard let creds else {
+                print("[\(acct.name)] ERROR — \(err ?? "no credentials")")
+                group.leave()
+                return
+            }
+            var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
+            req.setValue("Bearer \(creds.accessToken)", forHTTPHeaderField: "Authorization")
+            req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+            req.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+            URLSession.shared.dataTask(with: req) { data, resp, _ in
+                let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
+                let body = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+                print("[\(acct.name)] HTTP \(code)\n\(body)")
+                group.leave()
+            }.resume()
+        }
+    }
+    let deadline = Date().addingTimeInterval(30)
+    while Date() < deadline {
+        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.2))
+        if group.wait(timeout: .now()) == .success { break }
+    }
+}
+
 // MARK: - --print mode (terminal diagnostics)
 
 func runPrint(cfg: AppConfig) {
@@ -807,12 +901,35 @@ func runSelfTest() -> Int {
         "not_a_bucket": "string",
     ]
     let lines = parseUsage(usage, labels: defaultLabels)
-    check(lines.map(\.label) == ["5h session", "Week", "mystery_used"],
-          "parseUsage: known order, zero unknown hidden, non-zero unknown shown")
+    check(lines.map(\.label) == ["5h session", "Week (all)", "mystery_used", "mystery_zero"],
+          "parseUsage: known order first, unknown kept with raw keys")
     check(lines[0].pct == 33 && lines[1].pct == 8, "parseUsage: rounding and Int utilization")
     check(lines[0].resetText.hasPrefix("→ "), "parseUsage: reset text present")
+    check(panelVisibleLines(lines).map(\.label) == ["5h session", "Week (all)", "mystery_used"],
+          "panelVisibleLines hides zero unknown buckets only")
     let wrapped = parseUsage(["data": usage], labels: defaultLabels)
-    check(wrapped.count == 3, "parseUsage: unwraps nested container")
+    check(wrapped.count == 4, "parseUsage: unwraps nested container")
+
+    let limitsUsage: [String: Any] = [
+        "five_hour": ["utilization": 99.0],
+        "limits": [
+            ["kind": "session", "percent": 12, "resets_at": future],
+            ["kind": "weekly_all", "percent": 36],
+            ["kind": "weekly_scoped", "percent": 55,
+             "scope": ["model": ["display_name": "Fable"]]],
+            ["kind": "mystery_kind", "percent": 0],
+        ],
+    ]
+    let ll = parseUsage(limitsUsage, labels: defaultLabels)
+    check(ll.map(\.label) == ["5h session", "Week (all)", "Week Fable", "mystery_kind"],
+          "limits array preferred over flat buckets, scoped model named from API")
+    check(ll[0].pct == 12 && ll[2].pct == 55, "limits percents parsed")
+    check(ll[0].resetText.hasPrefix("→ "), "limits resets_at parsed")
+    check(panelVisibleLines(ll).count == 3, "unknown zero limit kind hidden in panel")
+    check(parseUsage(limitsUsage, labels: ["weekly_scoped:Fable": "Неделя Fable"])[2].label == "Неделя Fable",
+          "scoped label override by kind:model key")
+    check(parseUsage(limitsUsage, labels: ["five_hour": "Сессия 5 ч"])[0].label == "Сессия 5 ч",
+          "legacy bucket label keys still apply to limit kinds")
     let custom_labels = parseUsage(["five_hour": ["utilization": 1.0]],
                                    labels: ["five_hour": "Сессия 5 ч"])
     check(custom_labels.first?.label == "Сессия 5 ч", "parseUsage: label override")
@@ -856,6 +973,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if CommandLine.arguments.contains("--print") {
             detectCLIVersion()
             runPrint(cfg: loadConfig())
+            return
+        }
+        if CommandLine.arguments.contains("--raw") {
+            detectCLIVersion()
+            runRaw(cfg: loadConfig())
             return
         }
         let app = NSApplication.shared

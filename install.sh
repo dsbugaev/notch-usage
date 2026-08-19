@@ -6,8 +6,35 @@ cd "$(dirname "$0")"
 CFG="$HOME/.config/notch-usage/config.json"
 if [ ! -f "$CFG" ]; then
   mkdir -p "$(dirname "$CFG")"
-  cp config.example.json "$CFG"
-  echo "config: $CFG"
+  # Generate the initial config from Claude Code profile dirs that actually
+  # exist: ~/.claude plus any ~/.claude-* holding a profile marker file.
+  # config.example.json stays as documentation of the full format.
+  ACCOUNTS=""
+  add_account() {
+    local entry="    { \"name\": \"$1\", \"configDir\": \"$2\" }"
+    if [ -z "$ACCOUNTS" ]; then
+      ACCOUNTS="$entry"
+    else
+      ACCOUNTS="$ACCOUNTS,
+$entry"
+    fi
+  }
+  [ -d "$HOME/.claude" ] && add_account "Claude" "~/.claude"
+  for d in "$HOME"/.claude-*/; do
+    [ -e "${d}.claude.json" ] || [ -e "${d}settings.json" ] || continue
+    base=$(basename "$d")
+    add_account "Claude (${base#.claude-})" "~/$base"
+  done
+  [ -z "$ACCOUNTS" ] && add_account "Claude" "~/.claude"
+  cat > "$CFG" <<EOF
+{
+  "accounts": [
+$ACCOUNTS
+  ],
+  "refreshSeconds": 300
+}
+EOF
+  echo "config generated from existing profiles: $CFG"
 fi
 
 PLIST="$HOME/Library/LaunchAgents/ru.bugaev.notchusage.plist"

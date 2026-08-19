@@ -24,7 +24,7 @@
 
 ## Конфиг
 
-`~/.config/notch-usage/config.json`: список аккаунтов (`name` + `configDir`), интервал `refreshSeconds`, локаль `locale` (например `ru_RU`), русские подписи окон лимитов через `labels`. После правки: `pkill -x NotchUsage`.
+`~/.config/notch-usage/config.json` - генерируется при первой установке из реально существующих каталогов профилей (`~/.claude` + все `~/.claude-*`), так что с одним профилем в панели будет одна секция. Поля: список аккаунтов (`name` + `configDir`), интервал `refreshSeconds`, локаль `locale` (например `ru_RU`), русские подписи окон лимитов через `labels` (полный формат - в `config.example.json`). После правки: `pkill -x NotchUsage`.
 
 ## Диагностика
 
